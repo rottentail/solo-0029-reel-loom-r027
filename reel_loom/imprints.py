@@ -10,13 +10,26 @@ class Imprints:
         self.db, self.blobs, self.tickets, self.captions = db, blobs, tickets, captions
 
     def create(self, ticket_id, raw):
-        object_body(raw, ("cue_tracks",))
+        object_body(raw, ("cue_tracks", "caption_groups"))
         track_ids = raw.get("cue_tracks", [])
-        require(isinstance(track_ids, list) and len(track_ids) <= 64 and all(isinstance(x,str) for x in track_ids),
+        groups = raw.get("caption_groups")
+        require(isinstance(track_ids, list) and len(track_ids) <= 64 and all(isinstance(x, str) for x in track_ids),
                 "invalid_tracks", "cue_tracks must be an array of identifiers")
+        if groups is not None:
+            require(not track_ids, "invalid_body",
+                    "Choose either cue_tracks or caption_groups; the two delivery forms cannot be mixed")
         ticket = self.tickets.get(ticket_id)
         require(ticket["state"] == "succeeded", "imprint_state", "Only completed renditions can be packaged", 409)
-        caption = self.captions.project(ticket["reel"], ticket["revision"], track_ids) if track_ids else None
+        # The frozen program timeline comes from the render ticket; projecting captions never encodes media.
+        caption = None
+        captions = None
+        if groups is not None:
+            _, projected_groups = self.captions.project_groups(ticket["reel"], ticket["revision"], groups)
+            captions = [{"language": item["language"], "file": item["file"], "tracks": item["tracks"],
+                         "cue_count": item["cue_count"], "coverage": item["coverage"], "srt": item["srt"]}
+                        for item in projected_groups]
+        elif track_ids:
+            caption = self.captions.project(ticket["reel"], ticket["revision"], track_ids)
         files = []
         for item in ticket["artifacts"]:
             if item["kind"] != "rendition":
@@ -27,6 +40,9 @@ class Imprints:
         require(files, "missing_rendition", "A completed render requires a rendition artifact", 409)
         manifest = {"schema": 1, "ticket": ticket_id, "fingerprint": ticket["fingerprint"],
                     "snapshot": ticket["snapshot"], "files": files, "caption": caption}
+        if captions is not None:
+            # Multi-language hand-off: one SRT per language, the manifest tells the receiver which file to open.
+            manifest["captions"] = captions
         fingerprint = digest(manifest)
         with self.db.read() as db:
             row = db.execute("SELECT id FROM imprints WHERE fingerprint=?", (fingerprint,)).fetchone()
@@ -37,8 +53,10 @@ class Imprints:
                 self._write(archive, "manifest.json", canonical(manifest).encode())
                 if caption:
                     self._write(archive, "captions.srt", caption["srt"].encode())
+                for item in captions or []:
+                    self._write(archive, item["file"], item["srt"].encode())
                 for item in files:
-                    info = zipfile.ZipInfo(item["name"], date_time=(1980,1,1,0,0,0))
+                    info = zipfile.ZipInfo(item["name"], date_time=(1980, 1, 1, 0, 0, 0))
                     info.external_attr = 0o644 << 16
                     with archive.open(info, "w") as target, self.blobs.resolve(item["blob"], verify=True).open("rb") as source:
                         for chunk in iter(lambda: source.read(1024*1024), b""):
@@ -55,7 +73,7 @@ class Imprints:
                 return self.get(imprint_id, db)
 
     def _write(self, archive, name, content):
-        info = zipfile.ZipInfo(name, date_time=(1980,1,1,0,0,0))
+        info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
         info.external_attr = 0o644 << 16
         archive.writestr(info, content)
 
@@ -76,10 +94,24 @@ class Imprints:
             require(json.loads(archive.read("manifest.json")) == manifest,
                     "manifest_mismatch", "Packaged manifest differs from frozen record", 409)
             expected_names = {"manifest.json"} | {item["name"] for item in manifest["files"]}
+            verified_captions = []
             if manifest["caption"]:
                 expected_names.add("captions.srt")
                 require(archive.read("captions.srt").decode() == manifest["caption"]["srt"],
                         "caption_mismatch", "Packaged captions differ from frozen projection", 409)
+                verified_captions.append({"file": "captions.srt",
+                                          "languages": sorted({cue["language"] for cue in manifest["caption"]["cues"]}),
+                                          "cue_count": len(manifest["caption"]["cues"])})
+            for item in manifest.get("captions", []):
+                expected_names.add(item["file"])
+                packaged = archive.read(item["file"]).decode()
+                require(packaged == item["srt"], "caption_mismatch",
+                        "Packaged captions differ from frozen projection", 409, file=item["file"])
+                require(packaged.count(" --> ") == item["cue_count"], "caption_mismatch",
+                        "Packaged caption cue count differs from frozen record", 409, file=item["file"])
+                verified_captions.append({"file": item["file"], "language": item["language"],
+                                          "cue_count": item["cue_count"],
+                                          "fully_covered": item["coverage"]["fully_covered"]})
             require(set(archive.namelist()) == expected_names, "package_members", "Unexpected package members", 409)
             verified = []
             for item in manifest["files"]:
@@ -92,4 +124,5 @@ class Imprints:
                         "rendition_mismatch", "Packaged media differs from frozen content", 409)
                 verified.append(item["name"])
         return {"id": imprint_id, "valid": True, "verified_files": verified,
+                "verified_captions": verified_captions,
                 "fingerprint": imprint["fingerprint"], "blob": imprint["blob"]}

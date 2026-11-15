@@ -1,11 +1,13 @@
 """A bounded production walkthrough using generated audiovisual media and HTTP."""
 import argparse
 from dataclasses import replace
+import io
 import json
 from pathlib import Path
 import tempfile
 import threading
 import time
+import zipfile
 from .config import Settings
 from .application import Application
 from .api import Api
@@ -14,7 +16,8 @@ from .client import Client
 from .errors import LoomError, require
 
 WORKFLOWS = ("ingest", "revisions", "looks", "render", "signal", "waveform", "loudness",
-             "sheet", "captions", "imprint", "cancel-retry", "recovery", "resources", "matrix", "conformance", "lineage")
+             "sheet", "captions", "imprint", "multilingual-import", "cancel-retry", "recovery",
+             "resources", "matrix", "conformance", "lineage")
 
 
 def expect_error(action, code):
@@ -24,6 +27,12 @@ def expect_error(action, code):
         require(exc.code == code, "walkthrough_error", "Unexpected workflow rejection", expected=code, actual=exc.code)
         return exc.as_dict()
     raise RuntimeError("The walkthrough expected an operation to be rejected: " + code)
+
+
+def reel_duration(slices):
+    # Mirrors Reels.normalize: ordered half-open source intervals accumulate onto the program timeline.
+    from fractions import Fraction
+    return sum(round((Fraction(str(item["out"])) - Fraction(str(item["in"]))) * 1_000_000) for item in slices)
 
 
 class Walkthrough:
@@ -125,6 +134,129 @@ class Walkthrough:
             unchanged = c.imprint(ticket["id"])
             require(imprint["id"] == unchanged["id"], "walkthrough_imprint", "Upstream editing changed frozen imprint")
             return {"imprint": imprint, "verified": verified, "failure": failure}
+        if name == "multilingual-import":
+            # Two source media: the same finished program repeats and trims intervals from each source.
+            with self.app.blobs.temporary(".mp4") as sample:
+                self.app.processes.run(["-f", "lavfi", "-i", "testsrc=size=320x180:rate=25:duration=3",
+                                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+                                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                                        "-shortest", str(sample)])
+                second_bytes = sample.read_bytes()
+            second = c.ingest(second_bytes, "harbor-echo")
+            b = second["id"]
+            multi_slices = [{"asset": self.asset["id"], "in": .2, "out": 1.2, "label": "开场"},
+                            {"asset": b, "in": .4, "out": 1.4, "label": "中段"},
+                            {"asset": self.asset["id"], "in": 1.6, "out": 2.8, "label": "收束"}]
+            reel = c.create_reel("多语交接样片", multi_slices, "demo-multilingual-reel")
+            zh_srt = ("1\n00:00:00,500 --> 00:00:01,800\n第一段中文\n\n"
+                      "2\n00:00:02,000 --> 00:00:02,600\n末段中文\n")
+            en_srt = ("1\n00:00:00,500 --> 00:00:01,800\nFirst line in English\n\n"
+                      "2\n00:00:02,000 --> 00:00:02,600\nClosing line in English\n")
+            ja_srt = "1\n00:00:00,500 --> 00:00:01,300\n日本語の字幕\n"
+            zh = c.request("POST", f"/assets/{a}/cues", {"language": "zh-CN", "srt": zh_srt})
+            en = c.request("POST", f"/assets/{a}/cues", {"language": "en", "srt": en_srt})
+            ja = c.request("POST", f"/assets/{b}/cues", {"language": "ja", "srt": ja_srt})
+            groups = [{"language": "zh-CN", "tracks": [zh["id"]]},
+                      {"language": "en", "tracks": [en["id"]]},
+                      {"language": "ja", "tracks": [ja["id"]]}]
+
+            # 1) Roll preview: producers see coverage gaps per slice before any hand-off.
+            preview = c.caption_preview(reel["id"], groups, revision=1)
+            by_language = {item["language"]: item for item in preview["languages"]}
+            require(preview["duration_tick"] == reel_duration(multi_slices),
+                    "walkthrough_preview", "Preview timeline differs from the frozen reel")
+            require(by_language["zh-CN"]["coverage"]["fully_covered"] is False,
+                    "walkthrough_preview", "Coverage must report gaps rather than silently dropping them")
+            require(by_language["ja"]["coverage"]["slices"][2]["fully_covered"] is False
+                    and by_language["ja"]["coverage"]["slices"][2]["covered_tick"] == 0
+                    and by_language["ja"]["coverage"]["slices"][0]["covered_tick"] == 0
+                    and by_language["ja"]["coverage"]["slices"][1]["covered_tick"] > 0,
+                    "walkthrough_preview", "The Japanese track should cover only the slices its source feeds")
+            missing_slice = next(item for item in by_language["ja"]["coverage"]["missing_segments"] if item["slice"] == 1)
+            require(missing_slice["label"] == "中段",
+                    "walkthrough_preview", "Missing segment must name the slice that lacks cues")
+            preview_failures = [
+                expect_error(lambda: c.caption_preview(reel["id"], [{"language": "en", "tracks": [zh["id"]]}]),
+                             "language_mismatch"),
+                expect_error(lambda: c.caption_preview(reel["id"], groups + [{"language": "en", "tracks": [en["id"]]}]),
+                             "duplicate_language"),
+                expect_error(lambda: c.caption_preview(reel["id"], [{"language": "en", "tracks": [zh["id"], zh["id"]]}]),
+                             "duplicate_track"),
+            ]
+
+            # 2) A frozen render on the same reel; packaging never re-encodes the unchanged picture.
+            ticket = c.render(reel["id"], "preview", key="demo-multilingual-render")
+            while self.app.renderer.run_once() is not None:
+                pass
+            ticket = c.wait(ticket["id"], 5)
+            require(ticket["state"] == "succeeded", "walkthrough_render", "Multi-language render did not succeed")
+            media_blob = ticket["artifacts"][0]["blob"]
+
+            # 3) Multi-language imprint: one SRT per language, all sharing the program timeline.
+            imprint = c.imprint(ticket["id"], caption_groups=groups)
+            manifest = imprint["manifest"]
+            require([item["language"] for item in manifest["captions"]] == ["zh-CN", "en", "ja"],
+                    "walkthrough_imprint", "Imprint must keep one independent package entry per language")
+            require(all(item["file"].startswith("captions/") and item["file"].endswith(".srt")
+                        for item in manifest["captions"]), "walkthrough_imprint", "Caption file names must identify the language")
+            package = zipfile.ZipFile(io.BytesIO(c.request("GET", f"/imprints/{imprint['id']}/content", raw=True)))
+            names = set(package.namelist())
+            require(names == {"manifest.json", ticket["artifacts"][0]["id"] + ".mp4",
+                              "captions/zh-cn.srt", "captions/en.srt", "captions/ja.srt"},
+                    "walkthrough_imprint", "Package members do not match the frozen manifest")
+            zh_text = package.read("captions/zh-cn.srt").decode()
+            require(zh_text.count(" --> ") == 3 and "00:00:00,300 --> 00:00:01,000" in zh_text
+                    and "00:00:02,000 --> 00:00:02,200" in zh_text,
+                    "walkthrough_imprint", "Repeated source intervals must each project onto the program timeline")
+            require(package.read("captions/en.srt").decode().count(" --> ") == 3
+                    and package.read("captions/ja.srt").decode().count(" --> ") == 1,
+                    "walkthrough_imprint", "Languages must stay in separate tracks instead of one merged stream")
+
+            # 4) Imprint verification re-reads every packaged caption and the unchanged media bytes.
+            verified = c.request("GET", f'/imprints/{imprint["id"]}/verify')
+            require(verified["valid"] and len(verified["verified_captions"]) == 3
+                    and {item["language"] for item in verified["verified_captions"]} == {"zh-CN", "en", "ja"},
+                    "walkthrough_imprint", "Verification did not cover every packaged language")
+            require(next(item for item in verified["verified_captions"] if item["language"] == "ja")["fully_covered"] is False
+                    and next(item for item in verified["verified_captions"] if item["language"] == "zh-CN")["fully_covered"] is False,
+                    "walkthrough_imprint", "Verification must retain the coverage warnings seen in the preview")
+
+            # 5) Completing the Japanese track yields a new imprint; the historical package and bytes stay untouched.
+            ja_full = c.request("POST", f"/assets/{b}/cues",
+                                {"language": "ja",
+                                 "srt": ja_srt + "\n2\n00:00:01,000 --> 00:00:01,350\n追加された日本語\n"})
+            completed_groups = [{"language": "zh-CN", "tracks": [zh["id"]]},
+                                {"language": "en", "tracks": [en["id"]]},
+                                {"language": "ja", "tracks": [ja_full["id"]]}]
+            new_imprint = c.imprint(ticket["id"], caption_groups=completed_groups)
+            require(new_imprint["id"] != imprint["id"] and new_imprint["blob"] != imprint["blob"],
+                    "walkthrough_imprint", "Caption completion must create a new frozen delivery")
+            historical = c.request("GET", f"/imprints/{imprint['id']}/verify")
+            require(historical["valid"], "walkthrough_imprint", "Historical imprint must remain verifiable")
+            old_package = zipfile.ZipFile(io.BytesIO(c.request("GET", f"/imprints/{imprint['id']}/content", raw=True)))
+            require(old_package.read("captions/ja.srt").decode().count(" --> ") == 1,
+                    "walkthrough_imprint", "Historical package content changed after re-delivery")
+            new_manifest = new_imprint["manifest"]
+            require(new_manifest["files"][0]["blob"] == media_blob,
+                    "walkthrough_imprint", "Re-delivery must reuse the unchanged rendition instead of re-encoding")
+            new_verify = c.request("GET", f"/imprints/{new_imprint['id']}/verify")
+            require(new_verify["valid"], "walkthrough_imprint", "The replacement delivery must verify")
+
+            # 6) Legacy single-language call shape still works and stays a merged captions.srt.
+            legacy = c.imprint(ticket["id"], cue_tracks=[zh["id"]])
+            legacy_manifest = legacy["manifest"]
+            require("captions" not in legacy_manifest and legacy_manifest["caption"] is not None,
+                    "walkthrough_imprint", "Legacy cue_tracks delivery must keep its original manifest shape")
+            legacy_package = zipfile.ZipFile(io.BytesIO(c.request("GET", f"/imprints/{legacy['id']}/content", raw=True)))
+            require("captions.srt" in legacy_package.namelist()
+                    and "captions/zh-CN.srt" not in legacy_package.namelist(),
+                    "walkthrough_imprint", "Legacy packaging layout must remain unchanged")
+            mixed_failure = expect_error(
+                lambda: c.imprint(ticket["id"], cue_tracks=[zh["id"]], caption_groups=groups), "invalid_body")
+            return {"preview": preview, "imprint": imprint, "verified": verified,
+                    "new_imprint": new_imprint, "legacy_imprint": legacy,
+                    "reused_media_blob": media_blob, "preview_failures": preview_failures,
+                    "failure": mixed_failure}
         if name == "cancel-retry":
             cancelled = c.request("POST", f'/tickets/{self.ticket["id"]}/cancel')
             require(cancelled["state"] == "cancelled", "walkthrough_cancel", "Queued render did not cancel")

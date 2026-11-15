@@ -323,6 +323,27 @@
       ]
     },
     {
+      "id": "multilingual-import",
+      "name": "多语言字幕随印本一致交付",
+      "entry": "POST /reels/{id}/caption-preview + POST /tickets/{id}/imprints",
+      "success": "卷预览逐语言暴露镜段覆盖缺口，印本按语言独立打包且共享成片时间轴，补全字幕生成新印本且复用未变化成片",
+      "failure": "语言或字幕轨重复、语言不匹配、文件名冲突及两种交付形式混用拒绝",
+      "verification": ".venv/bin/python -m reel_loom.demo --workflow multilingual-import",
+      "steps": [
+        "输入经公开入口到领域规则",
+        "跨媒体或持久化边界提交结果",
+        "回读结果并观察拒绝路径"
+      ],
+      "module_ids": [
+        "api",
+        "captions",
+        "imprints",
+        "tickets",
+        "blobs",
+        "timebase"
+      ]
+    },
+    {
       "id": "cancel-retry",
       "name": "取消与原单重试",
       "entry": "POST /tickets/{id}/cancel,retry",

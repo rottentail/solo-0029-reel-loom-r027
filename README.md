@@ -21,6 +21,7 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python -m reel_loom.demo --workflow render
 .venv/bin/python -m reel_loom.demo --workflow imprint
+.venv/bin/python -m reel_loom.demo --workflow multilingual-import
 ```
 
 生产集成可使用 `reel_loom.client.Client`，或直接请求 API（路径均相对 `/loom/v1`）：
@@ -39,15 +40,26 @@ python3 -m venv .venv
 | 画面索引 | `POST /assets/{id}/contact-sheet`，`{"count":9,"columns":3}` |
 | 导入字幕 | `POST /assets/{id}/cues`，`{"language":"zh-CN","srt":"…"}` |
 | 映射字幕 | `POST /reels/{id}/captions`，`{"revision":1,"tracks":["cue_…"]}` |
+| 卷字幕预览 | `POST /reels/{id}/caption-preview`，`{"revision":1,"caption_groups":[{"language":"zh-CN","tracks":["cue_…"]}]}` |
 | 成片验规 | `GET /artifacts/{id}/conformance`，真实全解码 |
 | 血缘 | `GET /tickets/{id}/lineage` |
-| 交付印本 | `POST /tickets/{id}/imprints`，`{"cue_tracks":[]}`；`GET /imprints/{id}/verify` |
+| 交付印本 | `POST /tickets/{id}/imprints`，单语 `{"cue_tracks":[]}`；多语 `{"caption_groups":[{"language":"en","tracks":["cue_…"]}]}`；`GET /imprints/{id}/verify` |
 | 下载 | `GET /artifacts/{id}/content`、`/imprints/{id}/content` 或 `/blobs/{sha256}`，支持单一 byte range 与 ETag |
 | 资源 | `POST /assets/{id}/retire`、`restore`；`GET /resources`；`POST /resources/sweep`，默认 `dry_run:true` |
 
 `Idempotency-Key` 可用于创建剪辑卷、渲染单、渲染矩阵；重放返回最初创建响应，当前状态需 GET 回读。不同内容复用同一键返回 409。所有新引用要求 ready 来源；已冻结任务可以继续读退役来源。未完成渲染不能打包。取消运行单是请求，最终状态以 GET 为准；提交成片与成功状态在同一 SQLite 事务中。
 
 视频版式输出 H.264/AAC MP4，音频版式输出 PCM WAV；版式支持 1/2 声道、采样率、常量增益、contain/cover 和恒定帧率。剪辑卷当前采用顺序硬切，不具备多轨、转场、变速、字幕烧录或分段流能力。字幕保留源时间并在投影时按剪辑区间裁切；字幕轨创建后不可变。signal 输出 dBFS，loudness 才是 EBU R128，二者不可互换。
+
+### 多语言字幕交付
+
+一份成片可以同时交接多语言字幕，各语言独立成轨，不会被合并成一条混合字幕：
+
+- 先调用 `POST /reels/{id}/caption-preview` 做卷预览：按语言给出投影到成片时间轴的 cue，以及逐镜段的覆盖区间与缺失片段（含镜段标签和成片时间）。某语言缺少关键镜段时，制作人员在交接前即可从 `coverage` 看明白，无需下载印本后再发现。
+- 创建印本时使用 `caption_groups`：每组声明 `language` 与该语言的一个或多个源字幕轨（不同语言可引用不同来源媒体的轨）。包内生成 `captions/<language>.srt`，每种语言一份，全部对应同一冻结修订的成片时间；重复源片段会各自产生输出区间，裁切后仍可播放。manifest 的 `captions` 数组是语言索引，接收方据此知道该打开哪一份。
+- 校验 `GET /imprints/{id}/verify` 会重新读取包内每份字幕并与冻结投影逐字比对，逐语言返回 cue 数与覆盖告警，同时重新哈希包内成片字节。
+- 字幕补全或替换后再次创建印本会得到新的冻结交付（新 id、新指纹），历史印本的 ZIP、manifest 与校验结果保持原样；成片产物按内容寻址复用，字幕变更不会触发任何重新编码。
+- 原 `cue_tracks` 单语言调用方式与 `captions.srt` 包内布局保持不变；两种入参形式不能在同一请求中混用。
 
 ## 构建与生产流程校验
 
@@ -56,6 +68,6 @@ python3 -m venv .venv
 .venv/bin/python -m reel_loom.demo --workflow conformance
 ```
 
-全部 16 个有界流程记录在 `.project-runtime.json`，每条都经过真实领域与持久化路径，并观察成功或拒绝结果。测试延后：基线不包含单元/集成测试文件、不声明 test_command；这些生产示例不是完整测试保障。后续质量保障任务可从这些入口补建测试。
+全部 17 个有界流程记录在 `.project-runtime.json`，每条都经过真实领域与持久化路径，并观察成功或拒绝结果。测试延后：基线不包含单元/集成测试文件、不声明 test_command；这些生产示例不是完整测试保障。后续质量保障任务可从这些入口补建测试。
 
 源映射见 `.task-source.json`，业务边界见 `PROJECT_SPEC.md`。题库和内部难度证据在仓库外独立维护，不属于基线运行依赖。

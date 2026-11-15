@@ -65,8 +65,23 @@ class Client:
                 raise TimeoutError("Render did not reach a terminal state before the client deadline")
             time.sleep(.1)
 
-    def imprint(self, ticket_id, cue_tracks=None):
-        return self.request("POST", "/tickets/"+ticket_id+"/imprints", {"cue_tracks": cue_tracks or []})
+    def project_captions(self, reel_id, tracks, revision=None):
+        body = {"tracks": tracks}
+        if revision is not None:
+            body["revision"] = revision
+        return self.request("POST", "/reels/"+reel_id+"/captions", body)
+
+    def caption_preview(self, reel_id, caption_groups, revision=None):
+        body = {"caption_groups": caption_groups}
+        if revision is not None:
+            body["revision"] = revision
+        return self.request("POST", "/reels/"+reel_id+"/caption-preview", body)
+
+    def imprint(self, ticket_id, cue_tracks=None, caption_groups=None):
+        body = {"cue_tracks": cue_tracks or []}
+        if caption_groups is not None:
+            body["caption_groups"] = caption_groups
+        return self.request("POST", "/tickets/"+ticket_id+"/imprints", body)
 
     def download(self, path, destination):
         request = Request(self.base_url+path)

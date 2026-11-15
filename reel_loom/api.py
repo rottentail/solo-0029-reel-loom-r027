@@ -35,7 +35,7 @@ class Api:
                     "time_units": "seconds at input; integer microseconds in frozen records",
                     "render_modes": ["video/h264+aac", "audio/pcm_s16le"],
                     "editing": "ordered hard cuts; immutable revisions",
-                    "captions": "source SRT tracks projected to a reel revision"}
+                    "captions": "source SRT tracks projected to a reel revision; multi-language imprint delivery"}
         if route == "/assets":
             if method == "POST":
                 return app.assets.ingest(raw, headers.get("X-Media-Label", "未命名媒体"))
@@ -65,7 +65,7 @@ class Api:
                 return {"items": app.reels.list()}
             if method == "POST":
                 return app.reels.create(self.json_body(raw), headers.get("Idempotency-Key"))
-        match = re.fullmatch(r"/reels/([^/]+)(?:/(seal|captions|history))?", route)
+        match = re.fullmatch(r"/reels/([^/]+)(?:/(seal|captions|caption-preview|history))?", route)
         if match:
             reel_id, action = match.groups()
             if method == "GET" and not action:
@@ -82,6 +82,10 @@ class Api:
                 body = self.json_body(raw)
                 object_body(body, ("revision", "tracks"), ("tracks",))
                 return app.captions.project(reel_id, body.get("revision"), body["tracks"])
+            if method == "POST" and action == "caption-preview":
+                body = self.json_body(raw)
+                object_body(body, ("revision", "caption_groups"), ("caption_groups",))
+                return app.captions.preview(reel_id, body.get("revision"), body["caption_groups"])
         if method == "GET" and route == "/looks":
             return {"items": app.looks.list()}
         look_history = re.fullmatch(r"/looks/([^/]+)/history", route)

@@ -48,6 +48,10 @@
       "command": ".venv/bin/python -m reel_loom.demo --workflow imprint"
     },
     {
+      "workflow_id": "multilingual-import",
+      "command": ".venv/bin/python -m reel_loom.demo --workflow multilingual-import"
+    },
+    {
       "workflow_id": "cancel-retry",
       "command": ".venv/bin/python -m reel_loom.demo --workflow cancel-retry"
     },
